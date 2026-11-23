@@ -847,10 +847,11 @@ impl Viewer {
                     10.0,
                     if self.is_light() { 46 } else { 110 },
                 );
-                p.image(
+                rounded_image(
+                    p,
                     tex.id(),
                     fit,
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    3.0,
                     Color32::from_white_alpha(if hot { 255 } else if self.is_light() { 255 } else { 224 }),
                 );
             } else {
@@ -936,12 +937,7 @@ impl Viewer {
         // 直角图直接贴在背景上，只留一点很轻的投影，不再描边
         let shadow = if self.is_light() { 72 } else { 140 };
         soft_shadow(p, rect, 2.0, Vec2::new(0.0, 5.0), 28.0, shadow);
-        p.image(
-            tex.id(),
-            rect,
-            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-            Color32::WHITE,
-        );
+        rounded_image(p, tex.id(), rect, 3.0, Color32::WHITE);
     }
 
     fn draw_titlebar(&self, p: &egui::Painter, screen: Rect, ctx: &egui::Context, actions: &mut Actions) {
@@ -1286,12 +1282,7 @@ impl Viewer {
                     } else {
                         Color32::from_white_alpha((alpha as f32 * 0.66) as u8)
                     };
-                    p_img.image(
-                        tex.id(),
-                        r,
-                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                        tint,
-                    );
+                    rounded_image(p_img, tex.id(), r, 3.0, tint);
                 } else {
                     p_img.rect_filled(
                         r,
@@ -1513,6 +1504,78 @@ fn norm_path(p: PathBuf) -> PathBuf {
     p
 }
 
+/// 带圆角的图：三角扇 + 圆角边界，UV 按位置映射，3px 圆角不用去改纹理
+fn rounded_image(p: &egui::Painter, id: egui::TextureId, rect: Rect, radius: f32, tint: Color32) {
+    let r = radius
+        .max(0.0)
+        .min(rect.width() * 0.5)
+        .min(rect.height() * 0.5);
+    if r < 0.5 {
+        p.image(id, rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), tint);
+        return;
+    }
+    let mut mesh = Mesh::default();
+    mesh.texture_id = id;
+    let uv = |q: Pos2| {
+        Pos2::new(
+            ((q.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
+            ((q.y - rect.top()) / rect.height()).clamp(0.0, 1.0),
+        )
+    };
+    // 边界点连同外法线一起收，方便在边上再铺一圈全透明的羽化带，
+    // 否则 3px 这种小圆角会和背景撞出锯齿。
+    let mut pts: Vec<(Pos2, Vec2)> = Vec::new();
+    let seg = 10;
+    fn arc(out: &mut Vec<(Pos2, Vec2)>, c: Pos2, r: f32, a0: f32, a1: f32, seg: usize) {
+        for i in 0..=seg {
+            let t = i as f32 / seg as f32;
+            let a = (a0 + (a1 - a0) * t).to_radians();
+            let nrm = Vec2::new(a.cos(), a.sin());
+            out.push((c + nrm * r, nrm));
+        }
+    }
+    arc(&mut pts, Pos2::new(rect.left() + r, rect.top() + r), r, 180.0, 270.0, seg);
+    pts.push((Pos2::new(rect.right() - r, rect.top()), Vec2::new(0.0, -1.0)));
+    arc(&mut pts, Pos2::new(rect.right() - r, rect.top() + r), r, 270.0, 360.0, seg);
+    pts.push((Pos2::new(rect.right(), rect.bottom() - r), Vec2::new(1.0, 0.0)));
+    arc(&mut pts, Pos2::new(rect.right() - r, rect.bottom() - r), r, 0.0, 90.0, seg);
+    pts.push((Pos2::new(rect.left() + r, rect.bottom()), Vec2::new(0.0, 1.0)));
+    arc(&mut pts, Pos2::new(rect.left() + r, rect.bottom() - r), r, 90.0, 180.0, seg);
+    pts.push((Pos2::new(rect.left(), rect.top() + r), Vec2::new(-1.0, 0.0)));
+
+    let feather = 1.0;
+    let n = pts.len() as u32;
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: rect.center(),
+        uv: uv(rect.center()),
+        color: tint,
+    });
+    for (q, _) in &pts {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: *q,
+            uv: uv(*q),
+            color: tint,
+        });
+    }
+    for (q, nrm) in &pts {
+        let o = *q + *nrm * feather;
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: o,
+            uv: uv(o),
+            color: Color32::TRANSPARENT,
+        });
+    }
+    for i in 0..n {
+        let j = 1 + (i + 1) % n;
+        mesh.add_triangle(0, 1 + i, j);
+        let oi = 1 + n + i;
+        let oj = 1 + n + (i + 1) % n;
+        mesh.add_triangle(1 + i, j, oj);
+        mesh.add_triangle(1 + i, oj, oi);
+    }
+    p.add(egui::Shape::mesh(mesh));
+}
+
 fn recent_store_path() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -1541,7 +1604,7 @@ fn soft_shadow(p: &egui::Painter, rect: Rect, size: f32, distance: Vec2, blur: f
         spread: size.round().clamp(0.0, 255.0) as u8,
         color: Color32::from_black_alpha(opacity),
     };
-    p.add(egui::Shape::Rect(shadow.as_shape(rect, 0.0)));
+    p.add(egui::Shape::Rect(shadow.as_shape(rect, 3.0)));
 }
 
 /// 在框内按比例放一张图（contain）
@@ -1665,3 +1728,4 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {    let t = t.clamp(0.
     let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     Color32::from_rgba_unmultiplied(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()), mix(a.a(), b.a()))
 }
+
