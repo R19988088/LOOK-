@@ -99,6 +99,8 @@ pub struct Viewer {
     recent_closing: bool,
     /// 刚点的那一条，留着高亮给点反馈
     recent_active: Option<PathBuf>,
+    /// 面板开着时点过的那条，等面板收起再提到最前
+    recent_pending: Option<PathBuf>,
     /// `--demo-recent`：自动开面板并点第二条，给延时渐隐做验收用
     demo: bool,
     demo_start: std::time::Instant,
@@ -184,6 +186,7 @@ impl Viewer {
             recent_wait: None,
             recent_closing: false,
             recent_active: None,
+            recent_pending: None,
             demo: std::env::args().any(|a| a == "--demo-recent"),
             demo_start: std::time::Instant::now(),
             demo_fired: false,
@@ -236,40 +239,72 @@ impl Viewer {
 
     /// 记一条最近打开，最多留 RECENT_SLOTS 条，封面在后台解第一页
     fn note_recent(&mut self, path: PathBuf, title: String, kind: &'static str) {
-        // 已经在列表里就把旧条目（连同已解好的封面）捞出来，不要白白丢掉再重解
-        let old = self
-            .recent
-            .iter()
-            .position(|r| r.path == path)
-            .map(|i| self.recent.remove(i));
-        let cover = old.and_then(|r| r.cover);
-        let need_cover = cover.is_none();
-        self.recent.insert(
-            0,
-            RecentItem {
-                path: path.clone(),
-                title,
-                kind,
-                cover,
-            },
-        );
-        self.recent.truncate(RECENT_SLOTS);
-        if need_cover {
+        // 面板开着的时候顺序不许动（用户刚点的那条会跳上去，看着像列表在抽风），
+        // 先只更新信息、记下待提升，等面板收起再把它提到最前。
+        let open = self.recent_open;
+        if let Some(i) = self.recent.iter().position(|r| r.path == path) {
+            let need_cover = {
+                let item = &mut self.recent[i];
+                item.title = title;
+                item.kind = kind;
+                item.cover.is_none()
+            };
+            if need_cover {
+                spawn_cover(self.cover_tx.clone(), path.clone());
+            }
+            if open {
+                self.recent_pending = Some(path);
+            } else if i > 0 {
+                let item = self.recent.remove(i);
+                self.recent.insert(0, item);
+                self.recent.truncate(RECENT_SLOTS);
+            }
+        } else {
+            self.recent.insert(
+                0,
+                RecentItem {
+                    path: path.clone(),
+                    title,
+                    kind,
+                    cover: None,
+                },
+            );
+            if open {
+                // 面板开着先别裁，等收起时 promote 一并处理
+                self.recent_pending = Some(path.clone());
+            } else {
+                self.recent.truncate(RECENT_SLOTS);
+            }
             spawn_cover(self.cover_tx.clone(), path);
         }
-        // 顺手落盘，下次启动还在
-        if let Some(f) = recent_store_path() {
-            if let Some(dir) = f.parent() {
-                let _ = std::fs::create_dir_all(dir);
+        self.store_recent();
+    }
+
+    /// 把「面板开着时点过的那条」提到最前，并裁到 RECENT_SLOTS 条
+    fn promote_pending(&mut self) {
+        let Some(p) = self.recent_pending.take() else { return };
+        if let Some(i) = self.recent.iter().position(|r| r.path == p) {
+            if i > 0 {
+                let item = self.recent.remove(i);
+                self.recent.insert(0, item);
             }
-            let body = self
-                .recent
-                .iter()
-                .map(|r| r.path.to_string_lossy().to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let _ = std::fs::write(f, body);
         }
+        self.recent.truncate(RECENT_SLOTS);
+        self.store_recent();
+    }
+
+    fn store_recent(&self) {
+        let Some(f) = recent_store_path() else { return };
+        if let Some(dir) = f.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let body = self
+            .recent
+            .iter()
+            .map(|r| r.path.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = std::fs::write(f, body);
     }
 
     fn pump_covers(&mut self, ctx: &egui::Context) {
@@ -826,6 +861,8 @@ impl Viewer {
             }
         }
         if !self.recent_open {
+            // 面板收起来之后才动顺序，开着的时候列表是定住的
+            self.promote_pending();
             return;
         }
 
