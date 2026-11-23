@@ -123,6 +123,10 @@ pub struct Viewer {
     spread_mover: Option<usize>,
     /// 双页拖拽：拖的是哪张、起手 x、相对位移（按两张槽位间距算的比例）
     spread_drag: Option<SpreadDrag>,
+    /// 直接从 winit 记下来的指针：合成输入下 egui 的 pointer 不更新，拖拽不能指望它
+    raw_pos: Option<Pos2>,
+    raw_press: bool,
+    raw_release: bool,
     /// `--demo-spread`：自动切双页并对调一次，给验收用
     demo_spread: bool,
     demo_spread_hold: bool,
@@ -130,6 +134,14 @@ pub struct Viewer {
     demo_spread_fired2: bool,
     /// 第一帧的时间，演示计时从这里算，别把启动耗时也算进去
     demo_spread_at: Option<std::time::Instant>,
+    /// `--demo-drag`：用和真鼠标同样的通道，连做两轮双页拖拽
+    demo_drag: bool,
+    demo_drag_at: Option<std::time::Instant>,
+    demo_drag_step: u8,
+    demo_drag_anchor: Pos2,
+    demo_drag_span: f32,
+    /// 按帧计数的进度：窗口被遮住时帧会很稀，用时间轴跑不可靠
+    demo_drag_frames: u32,
 }
 
 impl Default for Viewer {
@@ -148,6 +160,20 @@ struct SpreadDrag {
     base: f32,
     /// 当前位移，按「两个槽位中心之间的距离」归一
     f: f32,
+}
+
+/// 松手时的换算：返回（这一帧的进度，动画要去的目标）。
+/// `base` 是起手时的进度，`idx` 是抓的那张的页码，`current` 是当前页。
+/// 抓的这张往对面拖够 14%，就对调；否则弹回起手位置。
+/// 抽成纯函数是为了能按真实手势序列跑单测（见 tests::spread_swap_repeats）。
+fn spread_release(base: f32, idx: usize, current: usize, from_left: bool, f: f32) -> (f32, f32) {
+    // a（当前页）往右走 t 增，b 往右走 t 减
+    let dir = if idx == current { 1.0 } else { -1.0 };
+    let p = (base + dir * f).clamp(0.0, 1.0);
+    let toward = if from_left { f > 0.0 } else { f < 0.0 };
+    let past = f.abs() >= 0.14 && toward;
+    // 目标永远落在两端的 0 或 1 上：动画中途按下去，base 可能是 0.8 这种小数
+    (p, if past { if base > 0.5 { 0.0 } else { 1.0 } } else { base })
 }
 
 impl Viewer {
@@ -233,11 +259,20 @@ impl Viewer {
             spread_t_to: 0.0,
             spread_mover: None,
             spread_drag: None,
+            raw_pos: None,
+            raw_press: false,
+            raw_release: false,
             demo_spread: std::env::args().any(|a| a == "--demo-spread" || a == "--demo-spread-hold"),
             demo_spread_hold: std::env::args().any(|a| a == "--demo-spread-hold"),
             demo_spread_fired: false,
             demo_spread_fired2: false,
             demo_spread_at: None,
+            demo_drag: std::env::args().any(|a| a == "--demo-drag"),
+            demo_drag_at: None,
+            demo_drag_step: 0,
+            demo_drag_anchor: Pos2::ZERO,
+            demo_drag_span: 400.0,
+            demo_drag_frames: 0,
         };
         let seeds: Vec<PathBuf> = v.recent.iter().map(|r| r.path.clone()).collect();
         for p in seeds {
@@ -565,6 +600,9 @@ impl Viewer {
             }
         }
         self.tick_spread_anim(&ctx);
+        if self.demo_drag {
+            self.demo_drag_tick(&ctx);
+        }
         self.handle_input(&ctx, &mut actions);
         let screen = root.max_rect();
         let painter = root.painter().clone();
@@ -1216,7 +1254,7 @@ impl Viewer {
 
             // 0 = 正常，1 = 对调。拖着的那张跟手走、从上面过去；另一张走得慢、
             // 中途缩一点、往下沉一点让路，两张才不会正好叠死在中间。
-            self.update_spread_drag(ctx, (ca_sw - ca_nat).x.max(1.0));
+            let travel = (ca_sw - ca_nat).x.max(1.0);
             let (t, mover) = self.spread_pose(a);
             let t = t.clamp(0.0, 1.0);
             let po = t.powf(1.8);
@@ -1265,6 +1303,8 @@ impl Viewer {
                     }
                 }
             }
+            // 命中判定必须放在矩形算好之后：早一步 self.page_rect 还是空的，按下去抓不到图
+            self.update_spread_drag(ctx, travel);
             return;
         }
 
@@ -1302,44 +1342,74 @@ impl Viewer {
         let shadow = if self.is_light() { 72 } else { 140 };
         soft_shadow(p, rect, 2.0, Vec2::new(0.0, 5.0), 28.0, shadow);
         rounded_image(p, tex.id(), rect, 3.0, Color32::WHITE);
-        // 单页没有对调这回事，残留的拖拽状态清掉
+        // 单页没有对调这回事：残留的拖拽状态、以及一路传进来没人接的按下/抬起都清掉，
+        // 否则攒到下次进双页会拿一个旧按键当「按下」
         self.spread_drag = None;
+        self.raw_press = false;
+        self.raw_release = false;
     }
 
     /// 双页模式下按住一张拖：它跟手走，对面那张缩着让路；松手时拖够了就换过去
     fn update_spread_drag(&mut self, ctx: &egui::Context, travel: f32) {
+        // 指针优先用 winit 直接喂进来的那份；--demo-drag 时只用演示脚本那一份，
+        // 真正的鼠标点击（egui 自己也会收到）不许插手，否则一轮都跑不干净
+        let pointer = self.raw_pos.or_else(|| ctx.input(|i| i.pointer.interact_pos()));
+        let (egui_press, egui_release) = if self.demo_drag {
+            (false, false)
+        } else {
+            ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released()))
+        };
+        let pressed = self.raw_press || egui_press;
+        let released = self.raw_release || egui_release;
+        self.raw_press = false;
+        self.raw_release = false;
         if !self.spread {
             self.spread_drag = None;
+            if pressed {
+                self.drag_log("press but not spread");
+            }
             return;
         }
-        let pointer = ctx.input(|i| i.pointer.interact_pos());
-        let pressed = ctx.input(|i| i.pointer.primary_pressed());
-        let released = ctx.input(|i| i.pointer.primary_released());
 
         if pressed {
             if let Some(q) = pointer {
                 let a = self.current;
                 let b = self.current + 1;
-                let swapped = self.spread_t > 0.5;
-                // 现在哪一侧放的是哪一页，按下的就是那张
+                // 哪张图在哪一侧要看几何，不能靠 spread_t 猜：动画中途两张会换边
+                let mid = match (self.page_rect, self.page_rect2) {
+                    (Some(r1), Some(r2)) => (r1.center().x + r2.center().x) * 0.5,
+                    _ => q.x,
+                };
+                let on_left = q.x < mid;
+                let mut hit: Option<(&'static str, usize)> = None;
                 if self.page_rect.map(|r| r.contains(q)).unwrap_or(false) {
-                    let idx = if swapped { b } else { a };
-                    self.spread_drag = Some(SpreadDrag {
-                        idx,
-                        start_x: q.x,
-                        from_left: true,
-                        base: self.spread_t,
-                        f: 0.0,
-                    });
+                    hit = Some(("a", a));
                 } else if self.page_rect2.map(|r| r.contains(q)).unwrap_or(false) {
-                    let idx = if swapped { a } else { b };
+                    hit = Some(("b", b));
+                }
+                if let Some((_, idx)) = hit {
                     self.spread_drag = Some(SpreadDrag {
                         idx,
                         start_x: q.x,
-                        from_left: false,
+                        from_left: on_left,
                         base: self.spread_t,
                         f: 0.0,
                     });
+                    self.drag_log(&format!(
+                        "press idx={idx} from_left={on_left} base={:.3} q=({:.0},{:.0}) frames={} raw={:?}",
+                        self.spread_t, q.x, q.y, self.demo_drag_frames, self.raw_pos
+                    ));
+                } else {
+                    self.drag_log(&format!(
+                        "press miss q=({:.0},{:.0}) raw={:?} egui={:?} frames={} rects={:?}/{:?}",
+                        q.x,
+                        q.y,
+                        self.raw_pos,
+                        ctx.input(|i| i.pointer.interact_pos()),
+                        self.demo_drag_frames,
+                        self.page_rect,
+                        self.page_rect2
+                    ));
                 }
             }
         }
@@ -1359,16 +1429,31 @@ impl Viewer {
 
         if released {
             let Some(d) = self.spread_drag.take() else { return };
-            // 换算成动画进度：a 往右走时 t 增，b 往右走时 t 减
-            let dir = if d.idx == self.current { 1.0 } else { -1.0 };
-            let p = (d.base + dir * d.f).clamp(0.0, 1.0);
-            // 往「对面」拖够 14% 才换，否则弹回原位
-            let toward = if d.from_left { d.f > 0.0 } else { d.f < 0.0 };
-            let past = d.f.abs() >= 0.14 && toward;
+            let (p, to) = spread_release(d.base, d.idx, self.current, d.from_left, d.f);
             self.spread_t = p;
             self.spread_mover = Some(d.idx);
-            self.spread_t_to = if past { 1.0 - d.base } else { d.base };
+            self.spread_t_to = to;
+            self.drag_log(&format!(
+                "release idx={} f={:.3} from_left={} t={:.3} to={:.3}",
+                d.idx, d.f, d.from_left, p, to
+            ));
             ctx.request_repaint();
+        }
+    }
+
+    /// 拖拽自测时把过程写进 testdata\drag.log，release 进程没有控制台，只能落文件
+    fn drag_log(&self, msg: &str) {
+        if !self.demo_drag {
+            return;
+        }
+        use std::io::Write;
+        let path = state_dir().join("drag.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{msg}");
         }
     }
 
@@ -1389,6 +1474,10 @@ impl Viewer {
 
     /// 推进对调动画：指数逼近，接着手指松手的位置继续走，不会有跳帧感
     fn tick_spread_anim(&mut self, ctx: &egui::Context) {
+        // 手指正抓着的时候由手指决定位置，动画别插一脚
+        if self.spread_drag.is_some() {
+            return;
+        }
         let d = self.spread_t_to - self.spread_t;
         if d.abs() < 0.002 {
             self.spread_t = self.spread_t_to;
@@ -1397,6 +1486,77 @@ impl Viewer {
         let dt = ctx.input(|i| i.stable_dt).clamp(0.0005, 0.05);
         self.spread_t += d * (1.0 - (-dt * 9.0).exp());
         ctx.request_repaint();
+    }
+
+    /// `--demo-drag`：走和真鼠标一模一样的通道（set_pointer / pointer_button）连拖三轮，
+    /// 左图往右、右图往左、再左图往右，用来验「能不能反复拖」。
+    /// 按帧计数，不按时间——窗口被遮住时帧会很稀，时间轴会把整轮压扁。
+    fn demo_drag_tick(&mut self, ctx: &egui::Context) {
+        if self.demo_drag_at.is_none() {
+            self.drag_log("boot demo-drag");
+        }
+        self.demo_drag_at.get_or_insert_with(|| std::time::Instant::now());
+        const PER_ROUND: u32 = 32;
+        const ROUNDS: u32 = 3;
+        let c = self.demo_drag_frames;
+        ctx.request_repaint();
+        if c >= PER_ROUND * ROUNDS {
+            return;
+        }
+        let round = (c / PER_ROUND) as usize;
+        let phase = c % PER_ROUND;
+        let grab_left = round % 2 == 0;
+        let key = (round as u8) * 2 + 1;
+
+        if phase == 0 {
+            let rects = match (self.page_rect, self.page_rect2) {
+                (Some(r1), Some(r2)) => {
+                    let (l, r) = if r1.center().x <= r2.center().x {
+                        (r1, r2)
+                    } else {
+                        (r2, r1)
+                    };
+                    Some((l, r))
+                }
+                _ => None,
+            };
+            // 第一帧两页可能还没画出来，这一帧不算数，等下一帧
+            let Some((l, r)) = rects else { return };
+            // 起手这一帧就老老实实按在原位，别一按下已经偏出去半个身位
+            self.demo_drag_step = key;
+            self.demo_drag_anchor = if grab_left { l.center() } else { r.center() };
+            self.demo_drag_span = (r.center().x - l.center().x).abs().max(120.0);
+            self.set_pointer(self.demo_drag_anchor.x, self.demo_drag_anchor.y);
+            self.pointer_button(true);
+        } else if phase <= 8 {
+            // 1..=8 帧推过去，推到 75% 的两槽间距
+            let k = phase as f32 / 8.0;
+            let dx = if grab_left { 1.0 } else { -1.0 } * self.demo_drag_span * 0.75 * k;
+            self.set_pointer(self.demo_drag_anchor.x + dx, self.demo_drag_anchor.y);
+        } else if phase == 9 {
+            self.demo_drag_step = key + 1;
+            self.pointer_button(false);
+        }
+        self.demo_drag_frames = c + 1;
+    }
+
+    /// `--demo-drag` 自测时独占指针通道：真鼠标的事件不再覆盖演示脚本喂进来的位置
+    pub fn demo_lock(&self) -> bool {
+        self.demo_drag
+    }
+
+    /// winit 喂进来的指针位置（逻辑像素，和 egui 同一套坐标）
+    pub fn set_pointer(&mut self, x: f32, y: f32) {
+        self.raw_pos = Some(Pos2::new(x, y));
+    }
+
+    /// 左键按下 / 抬起，给双页拖拽用
+    pub fn pointer_button(&mut self, down: bool) {
+        if down {
+            self.raw_press = true;
+        } else {
+            self.raw_release = true;
+        }
     }
 
     /// 单页 / 双页、以及漫画的左右阅读朝向（true = 右开、当前页在右边）
@@ -2260,8 +2420,142 @@ fn spawn_cover(tx: crossbeam_channel::Sender<CoverArt>, path: PathBuf) {
         .ok();
 }
 
-fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {    let t = t.clamp(0.0, 1.0);
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
     let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     Color32::from_rgba_unmultiplied(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()), mix(a.a(), b.a()))
+}
+
+/// 数据目录：%LOCALAPPDATA%\comicpp（和 main.rs 里的 state.txt 同一个地方）
+fn state_dir() -> PathBuf {
+    match std::env::var("LOCALAPPDATA") {
+        Ok(p) => PathBuf::from(p).join("comicpp"),
+        Err(_) => PathBuf::from("."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spread_release;
+    use super::{Pos2, Rect, Vec2, Viewer};
+
+    fn band(left: f32) -> (Rect, Rect) {
+        // 左图、右图两个槽位（命中判定用的就是这两个矩形）
+        (
+            Rect::from_min_size(Pos2::new(left, 52.0), Vec2::new(400.0, 970.0)),
+            Rect::from_min_size(Pos2::new(left + 406.0, 52.0), Vec2::new(400.0, 970.0)),
+        )
+    }
+
+    /// 走一遍真正的按下 / 移动 / 松手（含命中判定），连做三轮，验证能反复对调
+    #[test]
+    fn drag_sequence_repeats_end_to_end() {
+        let ctx = egui::Context::default();
+        let mut v = Viewer::new();
+        v.spread = true;
+        v.current = 0;
+        v.spread_t = 0.0;
+        v.spread_t_to = 0.0;
+
+        // 只喂 winit 那一路指针（和真机同一通道），egui 自己的 pointer 一直是空的
+        let step = |v: &mut Viewer, ctx: &egui::Context| v.update_spread_drag(ctx, 406.0);
+
+        // —— 第一轮：t=0，左槽是 a(当前页)，按住往右拖
+        let (l, r) = band(120.0);
+        v.page_rect = Some(l);
+        v.page_rect2 = Some(r);
+        v.set_pointer(l.center().x, l.center().y);
+        v.pointer_button(true);
+        step(&mut v, &ctx);
+        let d = v.spread_drag.as_ref().expect("按下左图就应该抓住它");
+        assert_eq!((d.idx, d.from_left), (0, true));
+
+        v.set_pointer(r.center().x, l.center().y);
+        step(&mut v, &ctx);
+        v.pointer_button(false);
+        step(&mut v, &ctx);
+        assert_eq!(v.spread_t_to, 1.0, "第一轮应该换过去");
+        v.spread_t = 1.0;
+
+        // —— 第二轮：t=1，a 已经挪到右槽，按住右图往左拖，应该换回来
+        let (l, r) = band(120.0);
+        v.page_rect = Some(r); // page_rect 一直是 a 的矩形，对调后它在右边
+        v.page_rect2 = Some(l);
+        v.set_pointer(r.center().x, r.center().y);
+        v.pointer_button(true);
+        step(&mut v, &ctx);
+        let d = v.spread_drag.as_ref().expect("第二轮回拖也要抓得住");
+        assert_eq!((d.idx, d.from_left), (0, false), "右槽这时是当前页 a");
+
+        v.set_pointer(l.center().x, r.center().y);
+        step(&mut v, &ctx);
+        v.pointer_button(false);
+        step(&mut v, &ctx);
+        assert_eq!(v.spread_t_to, 0.0, "第二轮应该换回来");
+        v.spread_t = 0.0;
+
+        // —— 第三轮：还是原来的顺序，再按住左图往右拖，照样能换
+        let (l, r) = band(120.0);
+        v.page_rect = Some(l);
+        v.page_rect2 = Some(r);
+        v.set_pointer(l.center().x, l.center().y);
+        v.pointer_button(true);
+        step(&mut v, &ctx);
+        assert_eq!(v.spread_drag.as_ref().map(|d| d.idx), Some(0), "第三轮还要抓得住");
+        v.set_pointer(r.center().x, l.center().y);
+        step(&mut v, &ctx);
+        v.pointer_button(false);
+        step(&mut v, &ctx);
+        assert_eq!(v.spread_t_to, 1.0, "第三轮也换得过去");
+
+        // —— 按右图（b）往左拖，同样是对调
+        v.spread_t = 0.0;
+        v.spread_t_to = 0.0;
+        v.page_rect = Some(l);
+        v.page_rect2 = Some(r);
+        v.set_pointer(r.center().x, r.center().y);
+        v.pointer_button(true);
+        step(&mut v, &ctx);
+        let d = v.spread_drag.as_ref().expect("右图也该抓得住");
+        assert_eq!((d.idx, d.from_left), (1, false));
+        v.set_pointer(l.center().x, r.center().y);
+        step(&mut v, &ctx);
+        v.pointer_button(false);
+        step(&mut v, &ctx);
+        assert_eq!(v.spread_t_to, 1.0, "抓右图往左拖也是换");
+    }
+
+    /// 连拖三次：左图往右 → 右图往左 → 再左图往右，进度必须 0/1/0/1 来回，
+    /// 就是用户说的「能反复拖」。
+    #[test]
+    fn spread_swap_repeats() {
+        let cur = 0usize;
+        // 1) 正常顺序（t=0）按左边那张（a），往右拖 50%
+        let (p1, t1) = spread_release(0.0, 0, cur, true, 0.5);
+        assert!(p1 > 0.4, "起手后进度应该跟手：{p1}");
+        assert_eq!(t1, 1.0, "拖够了就该对调");
+
+        // 2) 对调后（t=1）按右边那张（此时右边是 a），往左拖 50%
+        let (p2, t2) = spread_release(1.0, 0, cur, false, -0.5);
+        assert!(p2 < 0.6, "第二轮回拖要跟手：{p2}");
+        assert_eq!(t2, 0.0, "第二轮应该换回来");
+
+        // 3) 再按左边那张往右拖
+        let (_, t3) = spread_release(0.0, 0, cur, true, 0.5);
+        assert_eq!(t3, 1.0, "第三次仍然要能换");
+
+        // 4) 对调后按左边那张（此时左边是 b），往右拖
+        let (_, t4) = spread_release(1.0, 1, cur, true, 0.5);
+        assert_eq!(t4, 0.0, "抓另一张往右拖同样换回来");
+    }
+
+    /// 拖得不够、或者方向不对，都得弹回原位，不能误判成对调
+    #[test]
+    fn spread_short_drag_snaps_back() {
+        let cur = 0usize;
+        assert_eq!(spread_release(0.0, 0, cur, true, 0.10).1, 0.0);
+        assert_eq!(spread_release(0.0, 0, cur, true, -0.40).1, 0.0);
+        assert_eq!(spread_release(1.0, 0, cur, false, 0.40).1, 1.0);
+    }
 }
 

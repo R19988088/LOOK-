@@ -42,6 +42,7 @@ wgpu 一套 API 覆盖 DX12 / Metal / Vulkan。所以选型：**Rust + 原生窗
   缩 15%、往下沉 14px 从底下让开；松手时拖过两槽间距的 14% 就换过去，否则弹回原位。换过去之后速度是指数逼近，
   从手指停下的位置接着走，不会跳帧。这个左右朝向是**漫画的阅读顺序设置**：记住之后换书、关掉重开都保持
   （右开时当前页在右侧，标题仍是 `1–2 / 3` 这样按阅读顺序排）。可以反复拖，来回换都行。
+  按下去抓的是**看得见的那张**——哪张在哪一侧按矩形算，不看动画进度，所以对调完接着再拖、来回连着拖都不会抓错图。
 - 画面区：整页图无描边，四角 3px 圆角，只有一层极淡的投影（浅色 alpha 20、深色 58，向下偏 5px）；深色主题下
   页面中心另有一圈极淡的径向柔光（egui 没有原生径向渐变，用三角扇多环网格拼的）。
 - 鼠标贴左右边缘浮出圆形翻页钮（46px，浅色是白底、深色是玻璃底），第 1 页不显示左钮、最后一页不显示右钮。
@@ -145,7 +146,15 @@ cargo build --release
 
 .\target\release\comicpp.exe "testdata\album\04.png" --demo-spread-hold
 # 同样 1.4s 触发，但停在动画正中间，方便截图核对「一张在上面、一张缩着沉下去」
+
+.\target\release\comicpp.exe "testdata\cvtest\01.png" --spread --demo-drag
+# 走和真鼠标同一条通道连拖三轮（左图往右、右图往左、再左图往右），验「能反复拖」；
+# 过程写进 %LOCALAPPDATA%\comicpp\drag.log
 ```
+
+对调的判定逻辑抽成了纯函数 `spread_release`，并配了单测：`cargo test --bin comicpp`
+里 `spread_swap_repeats` 跑手势换算、`drag_sequence_repeats_end_to_end` 走完整的按下 / 移动 / 松手
+（含命中判定）连做三轮，进度必须 0→1→0→1 来回。
 
 ## 代码结构
 

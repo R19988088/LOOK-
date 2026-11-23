@@ -523,6 +523,13 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
+                // 自己记一份指针，双页拖拽不看 egui 的 pointer（合成输入下它常常不动）；
+                // 但 --demo-drag 自测时这条通道归演示脚本独占，别被真鼠标插一脚
+                let sf = window.scale_factor().max(0.1) as f32;
+                if !self.viewer.demo_lock() {
+                    self.viewer
+                        .set_pointer(position.x as f32 / sf, position.y as f32 / sf);
+                }
                 let sz = window.inner_size();
                 let b = 7.0 * window.scale_factor();
                 let (w, h) = (sz.width as f64, sz.height as f64);
@@ -553,21 +560,25 @@ impl ApplicationHandler for App {
                         None => CursorIcon::Default,
                     });
                 }
-                if wants_repaint {
-                    window.request_redraw();
-                }
+                // 鼠标一动就重画：双页拖拽要跟手，不能等 egui 说要不要
+                window.request_redraw();
             }
             WindowEvent::MouseInput {
-                state: ElementState::Pressed,
+                state,
                 button: MouseButton::Left,
                 ..
             } => {
-                if let Some(dir) = self.resize_plan {
-                    let _ = window.drag_resize_window(dir);
+                if !self.viewer.demo_lock() {
+                    self.viewer
+                        .pointer_button(state == ElementState::Pressed);
                 }
-                if wants_repaint {
-                    window.request_redraw();
+                if state == ElementState::Pressed {
+                    if let Some(dir) = self.resize_plan {
+                        let _ = window.drag_resize_window(dir);
+                    }
                 }
+                // 拖拽要逐帧跟手，egui 不一定认这些事件
+                window.request_redraw();
             }
             _ => {
                 if wants_repaint {
