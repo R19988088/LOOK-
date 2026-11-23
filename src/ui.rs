@@ -89,6 +89,20 @@ pub struct Viewer {
     recent_drag: Option<(f32, f32)>,
     /// 这一拖已经超过阈值，抬手时就不算点条目了
     recent_dragged: bool,
+    /// 点了条目之后先留着的透明度，1 = 不透明
+    recent_fade: f32,
+    /// 渐隐前的等待（秒）：等右侧新书出现后再开始倒数
+    recent_hold: f32,
+    /// 点了条目但新书还没出来，等它出来再开始倒数
+    recent_wait: Option<PathBuf>,
+    /// 正在渐隐
+    recent_closing: bool,
+    /// 刚点的那一条，留着高亮给点反馈
+    recent_active: Option<PathBuf>,
+    /// `--demo-recent`：自动开面板并点第二条，给延时渐隐做验收用
+    demo: bool,
+    demo_start: std::time::Instant,
+    demo_fired: bool,
     cover_tx: crossbeam_channel::Sender<CoverArt>,
     cover_rx: crossbeam_channel::Receiver<CoverArt>,
 
@@ -165,6 +179,14 @@ impl Viewer {
             recent_target: 0.0,
             recent_drag: None,
             recent_dragged: false,
+            recent_fade: 1.0,
+            recent_hold: 0.0,
+            recent_wait: None,
+            recent_closing: false,
+            recent_active: None,
+            demo: std::env::args().any(|a| a == "--demo-recent"),
+            demo_start: std::time::Instant::now(),
+            demo_fired: false,
             cover_tx,
             cover_rx,
             theme: Theme::Light,
@@ -770,6 +792,9 @@ impl Viewer {
             actions.open_dialog = true;
         }
         let hovered = pointer.map(|q| btn.expand(5.0).contains(q)).unwrap_or(false);
+        if self.demo && !self.demo_fired && self.demo_start.elapsed().as_secs_f32() > 0.7 {
+            self.recent_open = true;
+        }
         if hovered || self.recent_open {
             p.circle_filled(btn.center(), 17.0, self.plate(210));
             p.circle_stroke(
@@ -792,9 +817,42 @@ impl Viewer {
 
         if hovered && ctx.input(|i| i.pointer.primary_clicked()) {
             self.recent_open = !self.recent_open;
+            if self.recent_open {
+                self.recent_fade = 1.0;
+                self.recent_hold = 0.0;
+                self.recent_wait = None;
+                self.recent_closing = false;
+                self.recent_active = None;
+            }
         }
         if !self.recent_open {
             return;
+        }
+
+        // 点条目后不马上收：等右侧新书真的出现，再等 1s，然后 0.22s 渐隐
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.05);
+        if let Some(w) = self.recent_wait.clone() {
+            if self.book.as_ref().map(|b| b.path == w).unwrap_or(false) {
+                self.recent_wait = None;
+                self.recent_hold = 1.0;
+            }
+        }
+        if self.recent_closing {
+            ctx.request_repaint();
+            self.recent_fade -= dt / 0.22;
+            if self.recent_fade <= 0.0 {
+                self.recent_fade = 0.0;
+                self.recent_closing = false;
+                self.recent_open = false;
+                self.recent_active = None;
+                return;
+            }
+        } else if self.recent_hold > 0.0 {
+            ctx.request_repaint();
+            self.recent_hold = (self.recent_hold - dt).max(0.0);
+            if self.recent_hold <= 0.0 {
+                self.recent_closing = true;
+            }
         }
 
         if self.recent.is_empty() {
@@ -867,13 +925,21 @@ impl Viewer {
             self.recent_scroll += (target - self.recent_scroll) * k;
             if (target - self.recent_scroll).abs() < 0.4 {
                 self.recent_scroll = target;
+            } else {
+                ctx.request_repaint();
             }
         }
         self.recent_scroll = self.recent_scroll.clamp(0.0, max_scroll);
         self.recent_target = self.recent_target.clamp(0.0, max_scroll);
-        let p = &p.with_clip_rect(list);
+        let mut pa = p.clone();
+        pa.set_opacity(self.recent_fade);
+        let p = &pa.with_clip_rect(list);
         let mut y = list_top - self.recent_scroll;
         let mut clicked: Option<PathBuf> = None;
+        if self.demo && !self.demo_fired && self.demo_start.elapsed().as_secs_f32() > 1.6 {
+            self.demo_fired = true;
+            clicked = self.recent.iter().nth(1).map(|i| i.path.clone());
+        }
         for item in self.recent.iter() {
             let row = Rect::from_min_size(
                 Pos2::new(screen.left() + 12.0, y),
@@ -884,8 +950,13 @@ impl Viewer {
                 Vec2::new(cover_w, cover_h),
             );
             let hot = pointer.map(|q| row.contains(q)).unwrap_or(false);
-            if hot {
-                p.rect_filled(row, 7.0, self.veil(12));
+            let active = self
+                .recent_active
+                .as_ref()
+                .map(|a| *a == item.path)
+                .unwrap_or(false);
+            if hot || active {
+                p.rect_filled(row, 7.0, self.veil(if active { 22 } else { 12 }));
             }
             let aspect = item
                 .cover
@@ -945,7 +1016,7 @@ impl Viewer {
                 Align2::LEFT_CENTER,
                 short_name(&item.title, 15),
                 FontId::proportional(11.0),
-                self.ink(if hot || current { 230 } else { 165 }),
+                self.ink(if hot || active || current { 230 } else { 165 }),
             );
             if hot && !self.recent_dragged && ctx.input(|i| i.pointer.primary_clicked()) {
                 clicked = Some(item.path.clone());
@@ -954,8 +1025,16 @@ impl Viewer {
         }
         if let Some(path) = clicked {
             let same = self.book.as_ref().map(|b| b.path == path).unwrap_or(false);
-            self.recent_open = false;
-            if !same {
+            // 不立刻收起：留在这里亮着，等右侧翻完再渐隐
+            self.recent_active = Some(path.clone());
+            self.recent_fade = 1.0;
+            self.recent_closing = false;
+            if same {
+                self.recent_wait = None;
+                self.recent_hold = 1.0;
+            } else {
+                self.recent_wait = Some(path.clone());
+                self.recent_hold = 0.0;
                 actions.open_path = Some(path);
             }
         }
