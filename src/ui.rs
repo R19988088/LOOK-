@@ -817,7 +817,7 @@ impl Viewer {
                     1.0,
                     Vec2::new(0.0, 3.0),
                     14.0,
-                    if self.is_light() { 40 } else { 110 },
+                    if self.is_light() { 60 } else { 130 },
                 );
                 p.image(
                     tex.id(),
@@ -917,7 +917,7 @@ impl Viewer {
             );
         }
         // 直角图直接贴在背景上，只留一点很轻的投影，不再描边
-        let shadow = if self.is_light() { 46 } else { 110 };
+        let shadow = if self.is_light() { 72 } else { 140 };
         soft_shadow(p, rect, 2.0, Vec2::new(0.0, 5.0), 28.0, shadow);
         p.image(
             tex.id(),
@@ -1241,11 +1241,11 @@ impl Viewer {
                 if let Some(tex) = self.thumbs.get(&idx) {
                     // 投影交给 epaint 的 Shadow 羽化（一条平滑渐变带），当前页把数值放大一圈
                     let base = if self.is_light() {
-                        if is_cur { 54 } else { 18 }
+                        if is_cur { 92 } else { 26 }
                     } else if is_cur {
-                        120
+                        155
                     } else {
-                        44
+                        56
                     };
                     let a = (base as f32 * alpha as f32 / 255.0) as u8;
                     if a > 0 {
