@@ -18,6 +18,8 @@ const DRAWER_MIN: f32 = 92.0;
 const THUMB_GAP: f32 = 10.0;
 /// 左侧"最近打开"保留几条
 const RECENT_SLOTS: usize = 6;
+/// 「最近打开」一条一行的高度：滚动按整行对齐，顶上半截的黑杠就不会出现
+const RECENT_ROW_H: f32 = 88.0;
 
 #[derive(Default)]
 pub struct Actions {
@@ -81,6 +83,10 @@ pub struct Viewer {
     recent: Vec<RecentItem>,
     recent_open: bool,
     recent_scroll: f32,
+    /// 按住列表往下拖：记下按下时的指针 y 和当时的滚动量
+    recent_drag: Option<(f32, f32)>,
+    /// 这一拖已经超过阈值，抬手时就不算点条目了
+    recent_dragged: bool,
     cover_tx: crossbeam_channel::Sender<CoverArt>,
     cover_rx: crossbeam_channel::Receiver<CoverArt>,
 
@@ -154,6 +160,8 @@ impl Viewer {
             recent,
             recent_open: false,
             recent_scroll: 0.0,
+            recent_drag: None,
+            recent_dragged: false,
             cover_tx,
             cover_rx,
             theme: Theme::Light,
@@ -542,10 +550,22 @@ impl Viewer {
         }
 
         if self.book.is_some() && scroll.y.abs() > 1.0 {
-            let hover_bottom = ctx.input(|i| i.pointer.hover_pos().map(|p| p.y).unwrap_or(0.0));
+            let hover = ctx.input(|i| i.pointer.hover_pos());
+            let vp = ctx.input(|i| i.viewport_rect());
+            // 指针压在「最近打开」面板上时，滚轮归列表，不翻页
+            let over_recent = self.recent_open
+                && hover
+                    .map(|q| {
+                        q.x >= vp.left()
+                            && q.x <= vp.left() + 240.0
+                            && q.y >= vp.top() + 50.0
+                            && q.y <= vp.bottom() - 16.0
+                    })
+                    .unwrap_or(false);
+            let hover_bottom = hover.map(|p| p.y).unwrap_or(0.0);
             let limit = ctx.input(|i| i.viewport_rect()).bottom()
                 - (self.drawer.max(HANDLE_REST) + 44.0);
-            if hover_bottom < limit {
+            if !over_recent && hover_bottom < limit {
                 if scroll.y < 0.0 {
                     self.next();
                 } else {
@@ -789,20 +809,53 @@ impl Viewer {
         let row_w = 210.0;
         let cover_w = 62.0;
         let cover_h = 76.0;
-        let row_h = 88.0;
+        let row_h = RECENT_ROW_H;
         let list_top = btn.bottom() + 8.0;
         let list_bottom = screen.bottom() - 16.0;
         let content_h = self.recent.len() as f32 * row_h;
         let max_scroll = (content_h - (list_bottom - list_top).max(0.0)).max(0.0);
         let list = Rect::from_min_max(
-            Pos2::new(screen.left() + 6.0, list_top - 4.0),
+            Pos2::new(screen.left() + 6.0, list_top),
             Pos2::new(screen.left() + 238.0, list_bottom),
         );
-        if pointer.map(|q| list.contains(q)).unwrap_or(false) {
+        // 面板一整块都能滚：滚轮不用压在缩略图上，按住还能往下拖
+        let panel = Rect::from_min_max(
+            Pos2::new(screen.left() + 2.0, btn.bottom() + 2.0),
+            Pos2::new(screen.left() + 240.0, list_bottom),
+        );
+        let inside = pointer.map(|q| panel.contains(q)).unwrap_or(false);
+        if inside {
             let delta = ctx.input(|i| i.smooth_scroll_delta.y);
-            if delta.abs() > 1.0 {
+            if delta.abs() > 0.1 {
                 self.recent_scroll -= delta;
+                // 滚轮按整行对齐：不会停在半格上，顶上就不会残留一条黑杠
+                self.recent_scroll = (self.recent_scroll / RECENT_ROW_H).round() * RECENT_ROW_H;
             }
+        }
+        if ctx.input(|i| i.pointer.primary_pressed()) {
+            if let Some(q) = pointer.filter(|q| panel.contains(*q)) {
+                self.recent_drag = Some((q.y, self.recent_scroll));
+                self.recent_dragged = false;
+            }
+        }
+        if let Some((y0, s0)) = self.recent_drag {
+            if ctx.input(|i| i.pointer.primary_down()) {
+                if let Some(q) = pointer {
+                    let dy = q.y - y0;
+                    if dy.abs() > 3.0 {
+                        self.recent_dragged = true;
+                    }
+                    self.recent_scroll = s0 - dy;
+                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                }
+            } else {
+                // 松手吸附到最近的一整行
+                self.recent_scroll =
+                    (self.recent_scroll / RECENT_ROW_H).round() * RECENT_ROW_H;
+                self.recent_drag = None;
+            }
+        } else if inside && max_scroll > 0.0 {
+            ctx.set_cursor_icon(egui::CursorIcon::Grab);
         }
         self.recent_scroll = self.recent_scroll.clamp(0.0, max_scroll);
         let p = &p.with_clip_rect(list);
@@ -881,7 +934,7 @@ impl Viewer {
                 FontId::proportional(11.0),
                 self.ink(if hot || current { 230 } else { 165 }),
             );
-            if hot && ctx.input(|i| i.pointer.primary_clicked()) {
+            if hot && !self.recent_dragged && ctx.input(|i| i.pointer.primary_clicked()) {
                 clicked = Some(item.path.clone());
             }
             y += row_h;
