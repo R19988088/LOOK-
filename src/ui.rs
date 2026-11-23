@@ -111,6 +111,24 @@ pub struct Viewer {
     theme: Theme,
     /// 当前整页图占的矩形，用来判断右键是否落在空白处
     page_rect: Option<Rect>,
+    /// 双页模式下右边那张
+    page_rect2: Option<Rect>,
+    /// 单页 / 双页
+    spread: bool,
+    /// 双页里左右对调的进度：0 = 正常，1 = 对调
+    spread_t: f32,
+    /// 对调动画要去的地方
+    spread_t_to: f32,
+    /// 这次对调里滑过去的是哪一张（画在最上面）
+    spread_mover: Option<usize>,
+    /// 双页拖拽：起手 x + 起手的是不是左边那张
+    spread_drag: Option<(f32, bool)>,
+    /// `--demo-spread`：自动切双页并对调一次，给验收用
+    demo_spread: bool,
+    demo_spread_hold: bool,
+    demo_spread_fired: bool,
+    /// 第一帧的时间，演示计时从这里算，别把启动耗时也算进去
+    demo_spread_at: Option<std::time::Instant>,
 }
 
 impl Default for Viewer {
@@ -194,6 +212,18 @@ impl Viewer {
             cover_rx,
             theme: Theme::Light,
             page_rect: None,
+            page_rect2: None,
+            spread: std::env::args().any(|a| {
+                a == "--spread" || a == "--demo-spread" || a == "--demo-spread-hold"
+            }),
+            spread_t: 0.0,
+            spread_t_to: 0.0,
+            spread_mover: None,
+            spread_drag: None,
+            demo_spread: std::env::args().any(|a| a == "--demo-spread" || a == "--demo-spread-hold"),
+            demo_spread_hold: std::env::args().any(|a| a == "--demo-spread-hold"),
+            demo_spread_fired: false,
+            demo_spread_at: None,
         };
         let seeds: Vec<PathBuf> = v.recent.iter().map(|r| r.path.clone()).collect();
         for p in seeds {
@@ -230,6 +260,10 @@ impl Viewer {
                 self.strip_target = None;
                 self.strip_center_once = start > 0;
                 self.status.clear();
+                // 新书回到正常页序
+                self.spread_t = 0.0;
+                self.spread_t_to = 0.0;
+                self.spread_mover = None;
                 self.book = Some(book);
                 self.note_recent(path.clone(), title, kind);
             }
@@ -401,13 +435,15 @@ impl Viewer {
     }
 
     fn next(&mut self) {
+        let step = if self.spread && self.total() > 1 { 2 } else { 1 };
         if self.current + 1 < self.total() {
-            self.goto(self.current + 1);
+            self.goto((self.current + step).min(self.total() - 1));
         }
     }
 
     fn prev(&mut self) {
-        self.goto(self.current.saturating_sub(1));
+        let step = if self.spread && self.total() > 1 { 2 } else { 1 };
+        self.goto(self.current.saturating_sub(step));
     }
 
     fn pump(&mut self, ctx: &egui::Context) {
@@ -489,6 +525,24 @@ impl Viewer {
         let ctx = root.ctx().clone();
         let mut actions = Actions::default();
         self.pump(&ctx);
+        // `--demo-spread`：过 1.4s 替用户做一次「左图往右拖」的对调，方便截图验收
+        if self.demo_spread && !self.demo_spread_fired {
+            let at = *self.demo_spread_at.get_or_insert_with(std::time::Instant::now);
+            if at.elapsed() > std::time::Duration::from_millis(1400) {
+                if self.demo_spread_hold {
+                    // 卡在动画正中间，专门给截图看「一张在上面走、一张缩着让路」
+                    self.spread_t = 0.5;
+                    self.spread_t_to = 0.5;
+                    self.spread_mover = Some(self.current);
+                } else {
+                    self.start_spread_swap(self.current);
+                }
+                self.demo_spread_fired = true;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+        }
+        self.tick_spread_anim(&ctx);
         self.handle_input(&ctx, &mut actions);
         let screen = root.max_rect();
         let painter = root.painter().clone();
@@ -533,7 +587,7 @@ impl Viewer {
                 scrim_top,
                 scrim_bot,
             );
-            self.draw_page(&painter, screen);
+            self.draw_page(&painter, screen, &ctx);
             self.draw_nav(&painter, screen, &ctx, &mut actions);
             self.draw_drawer(&painter, screen, &ctx, &mut actions);
             self.draw_hud(&painter, screen);
@@ -1077,7 +1131,126 @@ impl Viewer {
         }
     }
 
-    fn draw_page(&mut self, p: &egui::Painter, screen: Rect) {
+    fn draw_page(&mut self, p: &egui::Painter, screen: Rect, ctx: &egui::Context) {
+        self.page_rect = None;
+        self.page_rect2 = None;
+        // 抽屉拉多高，画面底部就让出多少：窗口尺寸不变，画面自己缩
+        let bottom_limit = screen.bottom() - self.drawer.max(HANDLE_REST) - 16.0;
+        let avail = Vec2::new(
+            screen.width() - 128.0,
+            (bottom_limit - screen.top() - 52.0).max(60.0),
+        );
+        let mid_y = screen.top() + 52.0 + avail.y * 0.5;
+
+        // 双页模式：当前页和下一页并排；最后一页只剩一张，就照单页居中
+        let two = self.spread && self.total() > 1 && self.current + 1 < self.total();
+        if two {
+            let a = self.current;
+            let b = self.current + 1;
+            let tex = |idx: usize| {
+                self.full
+                    .get(&idx)
+                    .map(|t| (t.id(), t.size_vec2()))
+                    .filter(|(_, s)| s.x > 1.0 && s.y > 1.0)
+            };
+            let ta = tex(a);
+            let tb = tex(b);
+            let Some(base) = ta.map(|t| t.1).or_else(|| tb.map(|t| t.1)) else {
+                p.text(
+                    screen.center(),
+                    Align2::CENTER_CENTER,
+                    format!(
+                        "第 {} / {} 页 · 载入中…",
+                        self.current + 1,
+                        self.total()
+                    ),
+                    FontId::proportional(14.0),
+                    self.ink(120),
+                );
+                return;
+            };
+            let gap = 6.0;
+            let half = ((avail.x - gap) * 0.5).max(40.0);
+            // 两张一起缩，同一比例，高度才齐
+            let scale = (half / base.x).min(avail.y / base.y).min(24.0);
+            let sz = |t: Option<(egui::TextureId, Vec2)>| {
+                t.map(|t| t.1 * scale)
+                    .unwrap_or(base * scale)
+            };
+            let sa = sz(ta);
+            let sb = sz(tb);
+
+            // 两种摆法：正常 [当前, 下一页] 与对调 [下一页, 当前]
+            let arrange = |w1: f32, w2: f32| {
+                let total_w = w1 + gap + w2;
+                let x0 = screen.center().x - total_w * 0.5;
+                (
+                    Pos2::new(x0 + w1 * 0.5, mid_y),
+                    Pos2::new(x0 + w1 + gap + w2 * 0.5, mid_y),
+                )
+            };
+            let (ca_nat, cb_nat) = arrange(sa.x, sb.x);
+            let (cb_sw, ca_sw) = arrange(sb.x, sa.x);
+
+            // 0 = 正常，1 = 对调。拖着的那张走得快、从上面过去；另一张走得慢、
+            // 中途缩一点、往下沉一点让路，两张才不会正好叠死在中间。
+            let t = self.spread_t.clamp(0.0, 1.0);
+            let mover = self.spread_mover.unwrap_or(a);
+            let ease = |x: f32| {
+                let x = x.clamp(0.0, 1.0);
+                x * x * (3.0 - 2.0 * x)
+            };
+            let em = ease(t.powf(0.6));
+            let eo = ease(t.powf(2.4));
+            let ea = if mover == a { em } else { eo };
+            let eb = if mover == b { em } else { eo };
+            let shrink = 1.0 - 0.15 * (std::f32::consts::PI * t).sin();
+            let lift = -8.0 * (std::f32::consts::PI * t).sin();
+            let sink = 14.0 * (std::f32::consts::PI * t).sin();
+
+            let ca = ca_nat + (ca_sw - ca_nat) * ea;
+            let cb = cb_nat + (cb_sw - cb_nat) * eb;
+            let ra_size = if mover == a { sa } else { sa * shrink };
+            let rb_size = if mover == b { sb } else { sb * shrink };
+            let ca = ca + Vec2::new(0.0, if mover == a { lift } else { sink });
+            let cb = cb + Vec2::new(0.0, if mover == b { lift } else { sink });
+            let ra = Rect::from_center_size(ca, ra_size);
+            let rb = Rect::from_center_size(cb, rb_size);
+            self.page_rect = Some(ra);
+            self.page_rect2 = Some(rb);
+
+            let shadow = if self.is_light() { 72 } else { 140 };
+            if !self.is_light() {
+                for r in [ra, rb] {
+                    radial_glow(
+                        p,
+                        r.center(),
+                        Vec2::new(r.width() * 0.92, r.height() * 0.78),
+                        Color32::from_rgba_unmultiplied(150, 146, 255, 12),
+                    );
+                }
+            }
+            // 拖着的那张画在上面，先画另一张
+            let order = if mover == a {
+                [(b, rb, tb), (a, ra, ta)]
+            } else {
+                [(a, ra, ta), (b, rb, tb)]
+            };
+            for (_, r, tx) in order {
+                match tx {
+                    Some((id, _)) => {
+                        soft_shadow(p, r, 2.0, Vec2::new(0.0, 5.0), 28.0, shadow);
+                        rounded_image(p, id, r, 3.0, Color32::WHITE);
+                    }
+                    None => {
+                        p.rect_filled(r, 3.0, self.veil(10));
+                    }
+                }
+            }
+            self.update_spread_drag(ctx);
+            return;
+        }
+
         let Some(tex) = self.full.get(&self.current) else {
             p.text(
                 screen.center(),
@@ -1093,17 +1266,9 @@ impl Viewer {
             return;
         }
         // 抽屉拉多高，画面底部就让出多少：窗口尺寸不变，画面自己缩
-        let bottom_limit = screen.bottom() - self.drawer.max(HANDLE_REST) - 16.0;
-        let avail = Vec2::new(
-            screen.width() - 128.0,
-            (bottom_limit - screen.top() - 52.0).max(60.0),
-        );
         let scale = (avail.x / size.x).min(avail.y / size.y).min(24.0);
         let draw_size = size * scale;
-        let center = Pos2::new(
-            screen.center().x,
-            screen.top() + 52.0 + avail.y * 0.5,
-        );
+        let center = Pos2::new(screen.center().x, mid_y);
         let rect = Rect::from_center_size(center, draw_size);
         self.page_rect = Some(rect);
 
@@ -1120,9 +1285,80 @@ impl Viewer {
         let shadow = if self.is_light() { 72 } else { 140 };
         soft_shadow(p, rect, 2.0, Vec2::new(0.0, 5.0), 28.0, shadow);
         rounded_image(p, tex.id(), rect, 3.0, Color32::WHITE);
+        self.update_spread_drag(ctx);
     }
 
-    fn draw_titlebar(&self, p: &egui::Painter, screen: Rect, ctx: &egui::Context, actions: &mut Actions) {
+    /// 双页模式下按住一张往另一边拖，拖够了就把左右两张对调
+    fn update_spread_drag(&mut self, ctx: &egui::Context) {
+        if !self.spread {
+            self.spread_drag = None;
+            return;
+        }
+        let pointer = ctx.input(|i| i.pointer.interact_pos());
+        let pressed = ctx.input(|i| i.pointer.primary_pressed());
+        let released = ctx.input(|i| i.pointer.primary_released());
+
+        if pressed {
+            if let Some(q) = pointer {
+                if self.page_rect.map(|r| r.contains(q)).unwrap_or(false) {
+                    self.spread_drag = Some((q.x, true));
+                } else if self.page_rect2.map(|r| r.contains(q)).unwrap_or(false) {
+                    self.spread_drag = Some((q.x, false));
+                }
+            }
+        }
+        if released {
+            self.spread_drag = None;
+            return;
+        }
+        if let Some((x0, is_left)) = self.spread_drag {
+            if let Some(q) = pointer {
+                let w = self.page_rect.map(|r| r.width()).unwrap_or(160.0);
+                // 拖过这张图 1/5 宽（最少 40px）就算要换
+                let thresh = (w * 0.2).clamp(40.0, 240.0);
+                let dx = q.x - x0;
+                if (is_left && dx > thresh) || (!is_left && dx < -thresh) {
+                    // 现在在左边的是哪一页，拖的就是它
+                    let cur = self.current;
+                    let swapped = self.spread_t_to > 0.5;
+                    let grabbed = match (is_left, swapped) {
+                        (true, false) => cur,
+                        (true, true) => cur + 1,
+                        (false, false) => cur + 1,
+                        (false, true) => cur,
+                    };
+                    self.spread_drag = None;
+                    self.start_spread_swap(grabbed);
+                }
+            }
+        }
+    }
+
+    /// 让 grabbed 这张滑到另一边去：对面那张缩一点从底下挤过去
+    fn start_spread_swap(&mut self, grabbed: usize) {
+        self.spread_mover = Some(grabbed);
+        self.spread_t_to = if self.spread_t_to > 0.5 { 0.0 } else { 1.0 };
+    }
+
+    /// 推进对调动画；没走完就一路请求重绘，别等输入才动
+    fn tick_spread_anim(&mut self, ctx: &egui::Context) {
+        let d = self.spread_t_to - self.spread_t;
+        if d.abs() < 0.0005 {
+            self.spread_t = self.spread_t_to;
+            return;
+        }
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.0005, 0.05);
+        // 0.42s 走完：够看清谁从上头过去、谁缩着让路
+        let step = dt / 0.42;
+        if d.abs() <= step {
+            self.spread_t = self.spread_t_to;
+        } else {
+            self.spread_t += d.signum() * step;
+        }
+        ctx.request_repaint();
+    }
+
+    fn draw_titlebar(&mut self, p: &egui::Painter, screen: Rect, ctx: &egui::Context, actions: &mut Actions) {
         let bar = Rect::from_min_size(screen.min, Vec2::new(screen.width(), 38.0));
         let pointer = ctx.input(|i| i.pointer.hover_pos());
 
@@ -1132,10 +1368,18 @@ impl Viewer {
         } else {
             self.draw_win_buttons(p, screen, ctx, actions)
         };
+        // 单页 / 双页切换，挨在窗口按钮左边
+        let mode_rect = self.draw_mode_toggle(p, screen, ctx);
 
         // 标题：淡淡的居中一行，不抢画面
         let title = if let Some(book) = &self.book {
-            format!("{}   {} / {}", book.title, self.current + 1, self.total())
+            if self.spread && self.total() > 1 && self.current + 1 < self.total() {
+                let a = self.current + 1;
+                let b = self.current + 2;
+                format!("{}   {}–{} / {}", book.title, a, b, self.total())
+            } else {
+                format!("{}   {} / {}", book.title, self.current + 1, self.total())
+            }
         } else {
             "comic++".to_string()
         };
@@ -1151,11 +1395,63 @@ impl Viewer {
         let started = ctx.input(|i| i.pointer.primary_pressed());
         let in_bar = pointer.map(|q| bar.contains(q)).unwrap_or(false);
         let on_buttons = pointer
-            .map(|q| buttons_rect.contains(q) || q.y < screen.top() + 6.0)
+            .map(|q| {
+                buttons_rect.contains(q) || mode_rect.contains(q) || q.y < screen.top() + 6.0
+            })
             .unwrap_or(false);
         if in_bar && !on_buttons && started {
             actions.drag = true;
         }
+    }
+
+    /// 右上角那个单页/双页的图标：一个竖长小页 = 单页，两个并排 = 双页
+    fn draw_mode_toggle(&mut self, p: &egui::Painter, screen: Rect, ctx: &egui::Context) -> Rect {
+        let pointer = ctx.input(|i| i.pointer.hover_pos());
+        let bw = 40.0;
+        let bh = 30.0;
+        let top = screen.top() + 8.0;
+        // 在窗口三键左边留 8px；macOS 上按钮在左边，这里就贴着最右
+        let right = if cfg!(target_os = "macos") {
+            screen.right() - 10.0
+        } else {
+            screen.right() - 10.0 - 44.0 * 3.0 - 8.0
+        };
+        let r = Rect::from_min_size(Pos2::new(right - bw, top), Vec2::new(bw, bh));
+        let hovered = pointer.map(|q| r.contains(q)).unwrap_or(false);
+        let t = ctx.animate_bool_with_time(egui::Id::new("spread_toggle"), hovered, 0.12);
+        if t > 0.01 {
+            p.rect_filled(r, 7.0, self.veil((t * 26.0) as u8));
+        }
+        let c = r.center();
+        let ink = self.ink(if self.spread { 210 } else { 175 });
+        if self.spread {
+            for dx in [-6.0f32, 4.0] {
+                p.rect_stroke(
+                    Rect::from_center_size(c + Vec2::new(dx, 0.0), Vec2::new(7.5, 12.5)),
+                    1.5,
+                    Stroke::new(1.2, ink),
+                    StrokeKind::Inside,
+                );
+            }
+        } else {
+            p.rect_stroke(
+                Rect::from_center_size(c, Vec2::new(9.5, 12.5)),
+                1.5,
+                Stroke::new(1.2, ink),
+                StrokeKind::Inside,
+            );
+        }
+        if hovered && ctx.input(|i| i.pointer.primary_clicked()) {
+            self.spread = !self.spread;
+            self.spread_drag = None;
+            // 切回单页就把对调状态收回去，下次进来还是正常顺序（动画藏着走完，不跳）
+            if !self.spread {
+                self.spread_t_to = 0.0;
+                self.spread_mover = None;
+            }
+            ctx.request_repaint();
+        }
+        r
     }
 
     /// macOS：左侧三个彩色圆点，hover 才露出符号。
