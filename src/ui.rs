@@ -1120,6 +1120,7 @@ impl Viewer {
         if in_hit && dbl {
             // 双击：一把推到默认高度，或者直接收回去
             self.drawer_drag = false;
+            self.recent_open = false;
             self.drawer_target = if self.drawer > DRAWER_MIN {
                 0.0
             } else {
@@ -1127,6 +1128,7 @@ impl Viewer {
             };
         } else if in_hit && pressed {
             self.drawer_drag = true;
+            self.recent_open = false;
             self.drawer_grab = pointer.map(|q| q.y - handle_bottom).unwrap_or(0.0);
         }
 
