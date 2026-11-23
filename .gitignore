@@ -1,0 +1,4 @@
+/target
+/comicpp.exe
+/testdata/*
+!/testdata/f_light.png

@@ -1,0 +1,31 @@
+[package]
+name = "comicpp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+crossbeam-channel = "0.5.17"
+egui = "0.37.0"
+egui-wgpu = "0.37.0"
+egui-winit = "0.37.0"
+image = "0.25.10"
+lru = "0.19.1"
+num_cpus = "1.17.0"
+parking_lot = "0.13.0"
+pollster = "1.0.3"
+raw-window-handle = "0.6.2"
+rayon = "1.12.0"
+rfd = "0.18.0"
+sevenz-rust2 = "0.25.0"
+walkdir = "2.5.1"
+wgpu = "30.0.2"
+winit = "0.30.13"
+zip = { version = "9.8.1", features = ["deflate", "bzip2", "zstd"] }
+zune-jpeg = "0.5.15"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 1
