@@ -121,12 +121,13 @@ pub struct Viewer {
     spread_t_to: f32,
     /// 这次对调里滑过去的是哪一张（画在最上面）
     spread_mover: Option<usize>,
-    /// 双页拖拽：起手 x + 起手的是不是左边那张
-    spread_drag: Option<(f32, bool)>,
+    /// 双页拖拽：拖的是哪张、起手 x、相对位移（按两张槽位间距算的比例）
+    spread_drag: Option<SpreadDrag>,
     /// `--demo-spread`：自动切双页并对调一次，给验收用
     demo_spread: bool,
     demo_spread_hold: bool,
     demo_spread_fired: bool,
+    demo_spread_fired2: bool,
     /// 第一帧的时间，演示计时从这里算，别把启动耗时也算进去
     demo_spread_at: Option<std::time::Instant>,
 }
@@ -135,6 +136,18 @@ impl Default for Viewer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 双页里正在被按住拖的那张：页码、起手 x、起手时的左右朝向、当前位移比例
+struct SpreadDrag {
+    idx: usize,
+    start_x: f32,
+    /// 起手时这张在左边吗
+    from_left: bool,
+    /// 起手时的对调进度（0 或 1）
+    base: f32,
+    /// 当前位移，按「两个槽位中心之间的距离」归一
+    f: f32,
 }
 
 impl Viewer {
@@ -223,6 +236,7 @@ impl Viewer {
             demo_spread: std::env::args().any(|a| a == "--demo-spread" || a == "--demo-spread-hold"),
             demo_spread_hold: std::env::args().any(|a| a == "--demo-spread-hold"),
             demo_spread_fired: false,
+            demo_spread_fired2: false,
             demo_spread_at: None,
         };
         let seeds: Vec<PathBuf> = v.recent.iter().map(|r| r.path.clone()).collect();
@@ -260,10 +274,8 @@ impl Viewer {
                 self.strip_target = None;
                 self.strip_center_once = start > 0;
                 self.status.clear();
-                // 新书回到正常页序
-                self.spread_t = 0.0;
-                self.spread_t_to = 0.0;
-                self.spread_mover = None;
+                // 换书不动左右阅读朝向：漫画的「右开」是要一直用的设置
+                self.spread_drag = None;
                 self.book = Some(book);
                 self.note_recent(path.clone(), title, kind);
             }
@@ -525,7 +537,8 @@ impl Viewer {
         let ctx = root.ctx().clone();
         let mut actions = Actions::default();
         self.pump(&ctx);
-        // `--demo-spread`：过 1.4s 替用户做一次「左图往右拖」的对调，方便截图验收
+        // `--demo-spread`：1.4s 和 3.2s 各替用户做一次对调（连做两次，验能不能反复换），
+        // `--demo-spread-hold` 则停在动画正中间，方便截图核对
         if self.demo_spread && !self.demo_spread_fired {
             let at = *self.demo_spread_at.get_or_insert_with(std::time::Instant::now);
             if at.elapsed() > std::time::Duration::from_millis(1400) {
@@ -538,6 +551,15 @@ impl Viewer {
                     self.start_spread_swap(self.current);
                 }
                 self.demo_spread_fired = true;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+        }
+        if self.demo_spread && self.demo_spread_fired && !self.demo_spread_fired2 {
+            let at = *self.demo_spread_at.get_or_insert_with(std::time::Instant::now);
+            if at.elapsed() > std::time::Duration::from_millis(3200) {
+                self.start_spread_swap(self.current + 1);
+                self.demo_spread_fired2 = true;
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
@@ -1192,18 +1214,14 @@ impl Viewer {
             let (ca_nat, cb_nat) = arrange(sa.x, sb.x);
             let (cb_sw, ca_sw) = arrange(sb.x, sa.x);
 
-            // 0 = 正常，1 = 对调。拖着的那张走得快、从上面过去；另一张走得慢、
+            // 0 = 正常，1 = 对调。拖着的那张跟手走、从上面过去；另一张走得慢、
             // 中途缩一点、往下沉一点让路，两张才不会正好叠死在中间。
-            let t = self.spread_t.clamp(0.0, 1.0);
-            let mover = self.spread_mover.unwrap_or(a);
-            let ease = |x: f32| {
-                let x = x.clamp(0.0, 1.0);
-                x * x * (3.0 - 2.0 * x)
-            };
-            let em = ease(t.powf(0.6));
-            let eo = ease(t.powf(2.4));
-            let ea = if mover == a { em } else { eo };
-            let eb = if mover == b { em } else { eo };
+            self.update_spread_drag(ctx, (ca_sw - ca_nat).x.max(1.0));
+            let (t, mover) = self.spread_pose(a);
+            let t = t.clamp(0.0, 1.0);
+            let po = t.powf(1.8);
+            let ea = if mover == a { t } else { po };
+            let eb = if mover == b { t } else { po };
             let shrink = 1.0 - 0.15 * (std::f32::consts::PI * t).sin();
             let lift = -8.0 * (std::f32::consts::PI * t).sin();
             let sink = 14.0 * (std::f32::consts::PI * t).sin();
@@ -1247,7 +1265,6 @@ impl Viewer {
                     }
                 }
             }
-            self.update_spread_drag(ctx);
             return;
         }
 
@@ -1285,11 +1302,12 @@ impl Viewer {
         let shadow = if self.is_light() { 72 } else { 140 };
         soft_shadow(p, rect, 2.0, Vec2::new(0.0, 5.0), 28.0, shadow);
         rounded_image(p, tex.id(), rect, 3.0, Color32::WHITE);
-        self.update_spread_drag(ctx);
+        // 单页没有对调这回事，残留的拖拽状态清掉
+        self.spread_drag = None;
     }
 
-    /// 双页模式下按住一张往另一边拖，拖够了就把左右两张对调
-    fn update_spread_drag(&mut self, ctx: &egui::Context) {
+    /// 双页模式下按住一张拖：它跟手走，对面那张缩着让路；松手时拖够了就换过去
+    fn update_spread_drag(&mut self, ctx: &egui::Context, travel: f32) {
         if !self.spread {
             self.spread_drag = None;
             return;
@@ -1300,38 +1318,67 @@ impl Viewer {
 
         if pressed {
             if let Some(q) = pointer {
+                let a = self.current;
+                let b = self.current + 1;
+                let swapped = self.spread_t > 0.5;
+                // 现在哪一侧放的是哪一页，按下的就是那张
                 if self.page_rect.map(|r| r.contains(q)).unwrap_or(false) {
-                    self.spread_drag = Some((q.x, true));
+                    let idx = if swapped { b } else { a };
+                    self.spread_drag = Some(SpreadDrag {
+                        idx,
+                        start_x: q.x,
+                        from_left: true,
+                        base: self.spread_t,
+                        f: 0.0,
+                    });
                 } else if self.page_rect2.map(|r| r.contains(q)).unwrap_or(false) {
-                    self.spread_drag = Some((q.x, false));
+                    let idx = if swapped { a } else { b };
+                    self.spread_drag = Some(SpreadDrag {
+                        idx,
+                        start_x: q.x,
+                        from_left: false,
+                        base: self.spread_t,
+                        f: 0.0,
+                    });
                 }
             }
         }
-        if released {
-            self.spread_drag = None;
-            return;
-        }
-        if let Some((x0, is_left)) = self.spread_drag {
+
+        if let Some(d) = self.spread_drag.as_mut() {
             if let Some(q) = pointer {
-                let w = self.page_rect.map(|r| r.width()).unwrap_or(160.0);
-                // 拖过这张图 1/5 宽（最少 40px）就算要换
-                let thresh = (w * 0.2).clamp(40.0, 240.0);
-                let dx = q.x - x0;
-                if (is_left && dx > thresh) || (!is_left && dx < -thresh) {
-                    // 现在在左边的是哪一页，拖的就是它
-                    let cur = self.current;
-                    let swapped = self.spread_t_to > 0.5;
-                    let grabbed = match (is_left, swapped) {
-                        (true, false) => cur,
-                        (true, true) => cur + 1,
-                        (false, false) => cur + 1,
-                        (false, true) => cur,
-                    };
-                    self.spread_drag = None;
-                    self.start_spread_swap(grabbed);
+                let raw = (q.x - d.start_x) / travel.max(1.0);
+                // 拉过头就走橡皮筋，别让图飞出窗外
+                d.f = if raw.abs() <= 0.30 {
+                    raw
+                } else {
+                    raw.signum() * (0.30 + (raw.abs() - 0.30) * 0.4)
                 }
+                .clamp(-0.85, 0.85);
             }
         }
+
+        if released {
+            let Some(d) = self.spread_drag.take() else { return };
+            // 换算成动画进度：a 往右走时 t 增，b 往右走时 t 减
+            let dir = if d.idx == self.current { 1.0 } else { -1.0 };
+            let p = (d.base + dir * d.f).clamp(0.0, 1.0);
+            // 往「对面」拖够 14% 才换，否则弹回原位
+            let toward = if d.from_left { d.f > 0.0 } else { d.f < 0.0 };
+            let past = d.f.abs() >= 0.14 && toward;
+            self.spread_t = p;
+            self.spread_mover = Some(d.idx);
+            self.spread_t_to = if past { 1.0 - d.base } else { d.base };
+            ctx.request_repaint();
+        }
+    }
+
+    /// 当前该用哪个进度绘图：拖拽时把手指位移叠上去，停下就用动画进度
+    fn spread_pose(&self, a: usize) -> (f32, usize) {
+        if let Some(d) = &self.spread_drag {
+            let dir = if d.idx == a { 1.0 } else { -1.0 };
+            return ((d.base + dir * d.f).clamp(0.0, 1.0), d.idx);
+        }
+        (self.spread_t, self.spread_mover.unwrap_or(a))
     }
 
     /// 让 grabbed 这张滑到另一边去：对面那张缩一点从底下挤过去
@@ -1340,22 +1387,29 @@ impl Viewer {
         self.spread_t_to = if self.spread_t_to > 0.5 { 0.0 } else { 1.0 };
     }
 
-    /// 推进对调动画；没走完就一路请求重绘，别等输入才动
+    /// 推进对调动画：指数逼近，接着手指松手的位置继续走，不会有跳帧感
     fn tick_spread_anim(&mut self, ctx: &egui::Context) {
         let d = self.spread_t_to - self.spread_t;
-        if d.abs() < 0.0005 {
+        if d.abs() < 0.002 {
             self.spread_t = self.spread_t_to;
             return;
         }
         let dt = ctx.input(|i| i.stable_dt).clamp(0.0005, 0.05);
-        // 0.42s 走完：够看清谁从上头过去、谁缩着让路
-        let step = dt / 0.42;
-        if d.abs() <= step {
-            self.spread_t = self.spread_t_to;
-        } else {
-            self.spread_t += d.signum() * step;
-        }
+        self.spread_t += d * (1.0 - (-dt * 9.0).exp());
         ctx.request_repaint();
+    }
+
+    /// 单页 / 双页、以及漫画的左右阅读朝向（true = 右开、当前页在右边）
+    pub fn spread_state(&self) -> (bool, bool) {
+        (self.spread, self.spread_t_to > 0.5)
+    }
+
+    pub fn set_spread_state(&mut self, spread: bool, swap: bool) {
+        self.spread = spread;
+        let v = if swap { 1.0 } else { 0.0 };
+        self.spread_t = v;
+        self.spread_t_to = v;
+        self.spread_mover = None;
     }
 
     fn draw_titlebar(&mut self, p: &egui::Painter, screen: Rect, ctx: &egui::Context, actions: &mut Actions) {

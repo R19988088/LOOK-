@@ -15,6 +15,45 @@ use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
+/// 上次退出时的窗口位置/尺寸，以及单双页和漫画左右朝向
+#[derive(Clone, Copy, Default)]
+struct UiState {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    spread: bool,
+    swap: bool,
+    valid: bool,
+}
+
+fn state_path() -> Option<std::path::PathBuf> {
+    let base = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
+    Some(base.join("comicpp").join("state.txt"))
+}
+
+fn load_state() -> UiState {
+    let mut st = UiState::default();
+    let Some(f) = state_path() else { return st };
+    let Ok(s) = std::fs::read_to_string(f) else { return st };
+    for line in s.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let v = v.trim();
+        match k.trim() {
+            "x" => st.x = v.parse().unwrap_or(0.0),
+            "y" => st.y = v.parse().unwrap_or(0.0),
+            "w" => st.w = v.parse().unwrap_or(0.0),
+            "h" => st.h = v.parse().unwrap_or(0.0),
+            "spread" => st.spread = v == "1",
+            "swap" => st.swap = v == "1",
+            _ => {}
+        }
+    }
+    // 太小或明显跑到屏幕外的就当没记过（显示器换过之后别把人扔到看不见的地方）
+    st.valid = st.w >= 400.0 && st.h >= 300.0 && st.x > -2000.0 && st.y > -2000.0;
+    st
+}
+
 struct Gfx {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -189,9 +228,44 @@ struct App {
     worst: f64,
     /// 鼠标当前命中的窗口边缘（用于无边框窗口的自定义 resize）
     resize_plan: Option<ResizeDirection>,
+    /// 左上角记下来的界面状态：窗口几何 + 单双页 + 左右朝向
+    ui_state: UiState,
+    /// 上次写盘时间，拖动窗口时别每帧都写
+    last_state_save: Option<std::time::Instant>,
 }
 
 impl App {
+    /// 把窗口几何 + 单双页 + 左右朝向记下来，下次启动照原样回来
+    fn save_ui_state(&mut self, force: bool) {
+        let Some(w) = self.window.clone() else { return };
+        if !force {
+            if let Some(t) = self.last_state_save {
+                if t.elapsed() < Duration::from_millis(500) {
+                    return;
+                }
+            }
+        }
+        self.last_state_save = Some(std::time::Instant::now());
+        let sf = w.scale_factor().max(0.1);
+        let size = w.inner_size();
+        let pos = w.outer_position().ok();
+        let (spread, swap) = self.viewer.spread_state();
+        let Some(f) = state_path() else { return };
+        if let Some(dir) = f.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let body = format!(
+            "x={}\ny={}\nw={}\nh={}\nspread={}\nswap={}\n",
+            pos.map(|p| p.x as f64 / sf).unwrap_or(0.0),
+            pos.map(|p| p.y as f64 / sf).unwrap_or(0.0),
+            size.width as f64 / sf,
+            size.height as f64 / sf,
+            spread as u8,
+            swap as u8
+        );
+        let _ = std::fs::write(f, body);
+    }
+
     fn render(&mut self) -> Option<Duration> {
         let t0 = std::time::Instant::now();
         let window = self.window.clone()?;
@@ -324,6 +398,7 @@ impl App {
             let _ = window.drag_window();
         }
         if a.close {
+            self.save_ui_state(true);
             std::process::exit(0);
         }
         if a.minimize {
@@ -365,11 +440,27 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
+        let st = load_state();
+        self.ui_state = st;
+        // 命令行显式要双页时以命令行为准，别被上次的状态盖住
+        let forced = std::env::args().any(|a| {
+            a == "--spread" || a == "--demo-spread" || a == "--demo-spread-hold"
+        });
+        if !forced {
+            self.viewer.set_spread_state(st.spread, st.swap);
+        }
+        let mut attrs = Window::default_attributes()
             .with_title("comic++")
             .with_decorations(false)
-            .with_inner_size(LogicalSize::new(1180.0, 690.0))
+            .with_inner_size(if st.valid {
+                LogicalSize::new(st.w, st.h)
+            } else {
+                LogicalSize::new(1180.0, 690.0)
+            })
             .with_min_inner_size(LogicalSize::new(680.0, 460.0));
+        if st.valid {
+            attrs = attrs.with_position(winit::dpi::LogicalPosition::new(st.x, st.y));
+        }
         // 和参考项目一样：无标题栏窗口留 1px 非客户区，DWM 才会画标准的窗口投影和圆角
         #[cfg(target_os = "windows")]
         let attrs = {
@@ -377,6 +468,10 @@ impl ApplicationHandler for App {
             attrs.with_undecorated_shadow(true)
         };
         let window = Arc::new(event_loop.create_window(attrs).expect("创建窗口失败"));
+        // 双页 / 左右朝向跟着上次走：漫画的「右开」不用每本书重设一遍
+        let (spread, swap) = self.viewer.spread_state();
+        self.ui_state.spread = spread;
+        self.ui_state.swap = swap;
         #[cfg(target_os = "windows")]
         apply_window_appearance(&window, self.viewer.theme_is_light());
         self.gfx = Some(Gfx::new(window.clone()));
@@ -400,13 +495,18 @@ impl ApplicationHandler for App {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.save_ui_state(true);
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 if let Some(gfx) = self.gfx.as_mut() {
                     gfx.resize(size);
                 }
+                self.save_ui_state(false);
                 window.request_redraw();
             }
+            WindowEvent::Moved(_) => self.save_ui_state(false),
             WindowEvent::ScaleFactorChanged { .. } => window.request_redraw(),
             WindowEvent::RedrawRequested => {
                 let delay = self.render();
