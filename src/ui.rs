@@ -17,7 +17,7 @@ const HANDLE_REST: f32 = 26.0;
 const DRAWER_MIN: f32 = 92.0;
 const THUMB_GAP: f32 = 10.0;
 /// 左侧"最近打开"保留几条
-const RECENT_SLOTS: usize = 2;
+const RECENT_SLOTS: usize = 6;
 
 #[derive(Default)]
 pub struct Actions {
@@ -73,11 +73,14 @@ pub struct Viewer {
     thumb_h: f32,
     /// 点抽屉两侧小箭头时，缩略图条平滑滚向的目标位置
     strip_target: Option<f32>,
+    /// 刚打开一本书时，把当前页的缩略图滚到中间一次（之后点缩略图不再自动跳）
+    strip_center_once: bool,
     status: String,
 
     /// 左侧"最近打开"
     recent: Vec<RecentItem>,
     recent_open: bool,
+    recent_scroll: f32,
     cover_tx: crossbeam_channel::Sender<CoverArt>,
     cover_rx: crossbeam_channel::Receiver<CoverArt>,
 
@@ -146,9 +149,11 @@ impl Viewer {
             drawer_grab: 0.0,
             thumb_h: 58.0,
             strip_target: None,
+            strip_center_once: false,
             status: String::new(),
             recent,
             recent_open: false,
+            recent_scroll: 0.0,
             cover_tx,
             cover_rx,
             theme: Theme::Light,
@@ -180,10 +185,14 @@ impl Viewer {
                 self.book_id = self.decoder.new_book();
                 self.full.clear();
                 self.thumbs.clear();
-                self.thumb_index = 0;
-                self.current = 0;
+                // 单图打开时 pages 是整目录的图，当前页要定在用户点的那张上
+                let key = path.to_string_lossy().to_string();
+                let start = book.pages.iter().position(|p| p == &key).unwrap_or(0);
+                self.thumb_index = start;
+                self.current = start;
                 self.strip_scroll = 0.0;
                 self.strip_target = None;
+                self.strip_center_once = start > 0;
                 self.status.clear();
                 self.book = Some(book);
                 self.note_recent(path.clone(), title, kind);
@@ -478,7 +487,7 @@ impl Viewer {
                 let panel = if self.recent_open {
                     Rect::from_min_max(
                         Pos2::new(screen.left() + 4.0, screen.top() + 54.0),
-                        Pos2::new(screen.left() + 200.0, screen.bottom() - 30.0),
+                        Pos2::new(screen.left() + 232.0, screen.bottom() - 24.0),
                     )
                 } else {
                     Rect::NOTHING
@@ -776,20 +785,42 @@ impl Viewer {
             return;
         }
 
-        let card_w = 150.0;
-        let cover_h = 184.0;
-        let mut y = btn.bottom() + 14.0;
+        // 紧凑竖排：一条一行；窗口矮的时候用滚轮看后面的
+        let row_w = 210.0;
+        let cover_w = 62.0;
+        let cover_h = 76.0;
+        let row_h = 88.0;
+        let list_top = btn.bottom() + 8.0;
+        let list_bottom = screen.bottom() - 16.0;
+        let content_h = self.recent.len() as f32 * row_h;
+        let max_scroll = (content_h - (list_bottom - list_top).max(0.0)).max(0.0);
+        let list = Rect::from_min_max(
+            Pos2::new(screen.left() + 6.0, list_top - 4.0),
+            Pos2::new(screen.left() + 238.0, list_bottom),
+        );
+        if pointer.map(|q| list.contains(q)).unwrap_or(false) {
+            let delta = ctx.input(|i| i.smooth_scroll_delta.y);
+            if delta.abs() > 1.0 {
+                self.recent_scroll -= delta;
+            }
+        }
+        self.recent_scroll = self.recent_scroll.clamp(0.0, max_scroll);
+        let p = &p.with_clip_rect(list);
+        let mut y = list_top - self.recent_scroll;
         let mut clicked: Option<PathBuf> = None;
-        for item in &self.recent {
-            let cover = Rect::from_min_size(
-                Pos2::new(screen.left() + 16.0, y),
-                Vec2::new(card_w, cover_h),
+        for item in self.recent.iter() {
+            let row = Rect::from_min_size(
+                Pos2::new(screen.left() + 12.0, y),
+                Vec2::new(row_w, row_h - 6.0),
             );
-            let row = Rect::from_min_max(
-                Pos2::new(screen.left() + 10.0, y - 4.0),
-                Pos2::new(screen.left() + 16.0 + card_w + 4.0, y + cover_h + 30.0),
+            let cover = Rect::from_min_size(
+                Pos2::new(row.left() + 4.0, row.top() + 4.0),
+                Vec2::new(cover_w, cover_h),
             );
             let hot = pointer.map(|q| row.contains(q)).unwrap_or(false);
+            if hot {
+                p.rect_filled(row, 7.0, self.veil(12));
+            }
             let aspect = item
                 .cover
                 .as_ref()
@@ -808,16 +839,13 @@ impl Viewer {
                 cover
             };
             if let Some(tex) = &item.cover {
-                if hot {
-                    p.rect_filled(fit.expand(3.0), 0.0, self.veil(16));
-                }
                 soft_shadow(
                     p,
                     fit,
-                    1.0,
-                    Vec2::new(0.0, 3.0),
-                    14.0,
-                    if self.is_light() { 60 } else { 130 },
+                    0.0,
+                    Vec2::new(0.0, 2.0),
+                    10.0,
+                    if self.is_light() { 46 } else { 110 },
                 );
                 p.image(
                     tex.id(),
@@ -830,43 +858,32 @@ impl Viewer {
                 p.text(
                     cover.center(),
                     Align2::CENTER_CENTER,
-                    "载入封面…",
-                    FontId::proportional(11.0),
+                    "载入…",
+                    FontId::proportional(9.5),
                     self.ink(85),
                 );
             }
             let current = self.book.as_ref().map(|b| b.path == item.path).unwrap_or(false);
-            // 类型小标：图片 / 压缩包
-            let tag = Rect::from_min_size(fit.min + Vec2::new(6.0, 6.0), Vec2::new(44.0, 18.0));
-            p.rect_filled(tag, 0.0, self.plate(200));
+            // 类型 + 文件名放在封面右边，长名字能多露几个字
+            let tx = cover.right() + 10.0;
             p.text(
-                tag.center(),
-                Align2::CENTER_CENTER,
+                Pos2::new(tx, row.top() + 18.0),
+                Align2::LEFT_CENTER,
                 item.kind,
                 FontId::proportional(9.5),
-                self.ink(150),
-            );
-            // 文件名
-            let name = short_name(&item.title, 13);
-            p.rect_filled(
-                Rect::from_min_size(
-                    Pos2::new(fit.left(), y + cover_h + 6.0),
-                    Vec2::new(card_w, 18.0),
-                ),
-                0.0,
-                self.plate(150),
+                self.ink(125),
             );
             p.text(
-                Pos2::new(fit.left(), y + cover_h + 15.0),
+                Pos2::new(tx, row.top() + 40.0),
                 Align2::LEFT_CENTER,
-                name,
+                short_name(&item.title, 15),
                 FontId::proportional(11.0),
                 self.ink(if hot || current { 230 } else { 165 }),
             );
             if hot && ctx.input(|i| i.pointer.primary_clicked()) {
                 clicked = Some(item.path.clone());
             }
-            y += cover_h + 40.0;
+            y += row_h;
         }
         if let Some(path) = clicked {
             let same = self.book.as_ref().map(|b| b.path == path).unwrap_or(false);
@@ -1304,6 +1321,14 @@ impl Viewer {
         }
         let max_scroll = (self.content_width(total, self.thumb_h) - strip.width()).max(0.0);
 
+        // 刚打开一本书时把当前页的缩略图滚到中间一次
+        if self.strip_center_once {
+            let (cx, cw) = self.span_at(self.current, self.thumb_h);
+            self.strip_scroll =
+                (cx + cw * 0.5 - strip.width() * 0.5).clamp(0.0, max_scroll);
+            self.strip_center_once = false;
+        }
+
         // 抽屉两侧的小箭头：手动翻一屏缩略图，不跟着页码自动跳
         let step = (strip.width() * 0.86).max(120.0);
         for right_side in [false, true] {
@@ -1360,6 +1385,24 @@ impl Viewer {
             }
         }
         self.strip_scroll = self.strip_scroll.clamp(-8.0, max_scroll + 8.0);
+    }
+
+    /// 第 idx 张缩略图在不滚动时的 x 位置和宽度
+    fn span_at(&self, idx: usize, thumb_h: f32) -> (f32, f32) {
+        let mut x = 0.0;
+        for i in 0..=idx {
+            let aspect = self
+                .thumbs
+                .get(&i)
+                .map(|h| h.size_vec2().x / h.size_vec2().y)
+                .unwrap_or(0.72);
+            let w = (thumb_h * aspect).clamp(24.0, 220.0);
+            if i == idx {
+                return (x, w);
+            }
+            x += w + THUMB_GAP;
+        }
+        (0.0, thumb_h * 0.72)
     }
 
     fn content_width(&self, total: usize, thumb_h: f32) -> f32 {

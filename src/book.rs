@@ -41,13 +41,21 @@ impl Book {
             .unwrap_or("untitled")
             .to_string();
 
-        // 单张图片：当成只有一页的"书"，走文件夹同一条读取路径
+        // 单张图片：同目录里的其他图片一起排成序列，所以打开单图也能左右翻
         if path.is_file() && IMAGE_EXTS.contains(&ext.as_str()) {
+            let mut pages = Vec::new();
+            if let Some(dir) = path.parent() {
+                collect_images_shallow(dir, &mut pages);
+                pages.sort_by(|a, b| natural_cmp(a, b));
+            }
+            if pages.len() <= 1 {
+                pages = vec![path.to_string_lossy().to_string()];
+            }
             return Ok(Self {
                 path: path.to_path_buf(),
                 title,
                 kind: BookKind::Dir,
-                pages: vec![path.to_string_lossy().to_string()],
+                pages,
             });
         }
 
@@ -141,6 +149,23 @@ impl Book {
 
     pub fn page(&self, i: usize) -> Option<&str> {
         self.pages.get(i).map(|s| s.as_str())
+    }
+}
+
+fn collect_images_shallow(dir: &Path, out: &mut Vec<String>) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            continue;
+        }
+        if p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+            .unwrap_or(false)
+        {
+            out.push(p.to_string_lossy().to_string());
+        }
     }
 }
 
