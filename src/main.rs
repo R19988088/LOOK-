@@ -1,3 +1,6 @@
+// release 版不要弹黑色控制台窗口；debug 版留着，方便看日志和 panic
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod book;
 mod decode;
 mod ui;
