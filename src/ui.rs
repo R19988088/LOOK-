@@ -1819,7 +1819,8 @@ fn cover_cache_path(path: &std::path::Path) -> Option<PathBuf> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
-    let key = format!("{}|{}|{}", path.display(), mtime, meta.len());
+    // 开头这个版本号用来作废旧算法留下的缓存：以前单图取的是「目录第一张」，封面全是错的
+    let key = format!("3|{}|{}|{}", path.display(), mtime, meta.len());
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in key.as_bytes() {
         h ^= *b as u64;
@@ -1876,10 +1877,13 @@ fn spawn_cover(tx: crossbeam_channel::Sender<CoverArt>, path: PathBuf) {
                 }
             }
             let Ok(book) = Book::open(&path) else { return };
+            // 单张图打开时 pages 是整个目录的序列，封面必须取「点开的这一张」而不是第 0 张
+            let key = path.to_string_lossy().to_string();
+            let idx = book.pages.iter().position(|p| p == &key).unwrap_or(0);
             let Ok(mut reader) = crate::book::Reader::open(&book) else {
                 return;
             };
-            let Ok(raw) = reader.read(0) else { return };
+            let Ok(raw) = reader.read(idx) else { return };
             let Ok(img) = crate::book::decode_bytes(&raw.bytes) else {
                 return;
             };
