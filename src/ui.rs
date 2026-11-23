@@ -83,6 +83,8 @@ pub struct Viewer {
     recent: Vec<RecentItem>,
     recent_open: bool,
     recent_scroll: f32,
+    /// 滚动目标（未吸附），实际位置缓动追它，停下来时按整行对齐
+    recent_target: f32,
     /// 按住列表往下拖：记下按下时的指针 y 和当时的滚动量
     recent_drag: Option<(f32, f32)>,
     /// 这一拖已经超过阈值，抬手时就不算点条目了
@@ -160,6 +162,7 @@ impl Viewer {
             recent,
             recent_open: false,
             recent_scroll: 0.0,
+            recent_target: 0.0,
             recent_drag: None,
             recent_dragged: false,
             cover_tx,
@@ -827,15 +830,14 @@ impl Viewer {
         if inside {
             let delta = ctx.input(|i| i.smooth_scroll_delta.y);
             if delta.abs() > 0.1 {
-                self.recent_scroll -= delta;
-                // 滚轮按整行对齐：不会停在半格上，顶上就不会残留一条黑杠
-                self.recent_scroll = (self.recent_scroll / RECENT_ROW_H).round() * RECENT_ROW_H;
+                self.recent_target -= delta;
             }
         }
         if ctx.input(|i| i.pointer.primary_pressed()) {
             if let Some(q) = pointer.filter(|q| panel.contains(*q)) {
                 self.recent_drag = Some((q.y, self.recent_scroll));
                 self.recent_dragged = false;
+                self.recent_target = self.recent_scroll;
             }
         }
         if let Some((y0, s0)) = self.recent_drag {
@@ -846,18 +848,29 @@ impl Viewer {
                         self.recent_dragged = true;
                     }
                     self.recent_scroll = s0 - dy;
+                    self.recent_target = self.recent_scroll;
                     ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                 }
             } else {
-                // 松手吸附到最近的一整行
-                self.recent_scroll =
-                    (self.recent_scroll / RECENT_ROW_H).round() * RECENT_ROW_H;
+                // 松手后目标吸附到最近的一整行
                 self.recent_drag = None;
             }
         } else if inside && max_scroll > 0.0 {
             ctx.set_cursor_icon(egui::CursorIcon::Grab);
         }
+        // 停下来就停在整行上：顶上半截的黑杠不会出现，滚动也是滑过去的
+        let target = ((self.recent_target / RECENT_ROW_H).round() * RECENT_ROW_H)
+            .clamp(0.0, max_scroll);
+        if self.recent_drag.is_none() {
+            let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.05);
+            let k = 1.0 - (-dt * 13.0).exp();
+            self.recent_scroll += (target - self.recent_scroll) * k;
+            if (target - self.recent_scroll).abs() < 0.4 {
+                self.recent_scroll = target;
+            }
+        }
         self.recent_scroll = self.recent_scroll.clamp(0.0, max_scroll);
+        self.recent_target = self.recent_target.clamp(0.0, max_scroll);
         let p = &p.with_clip_rect(list);
         let mut y = list_top - self.recent_scroll;
         let mut clicked: Option<PathBuf> = None;
